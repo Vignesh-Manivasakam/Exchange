@@ -164,6 +164,7 @@ def initialize_file_session() -> None:
         "active_prompt_version": "v1",
         # Phase 6 — review panel
         "review_statuses": {},   # {query_id: "Pending" | "OK" | "Not OK"}
+        "review_remarks": {},    # {query_id: user_remark_text}
         "reviews_saved": False,
     }
     for key, default in defaults.items():
@@ -260,6 +261,7 @@ def render_review_panel(
     st.subheader("✏️ Manual Review")
 
     review_statuses = st.session_state.review_statuses
+    review_remarks = st.session_state.review_remarks
     total = len(results_df)
     pending = sum(1 for v in review_statuses.values() if v == "Pending")
     ok_count = sum(1 for v in review_statuses.values() if v == "OK")
@@ -293,6 +295,76 @@ def render_review_panel(
             f"(score 0.40–0.90 + New/Deleted). Toggle above to show all."
         )
 
+    # Build reference of display QIDs to map from row indexes during auto-save
+    temp_display_qids = []
+    for _, row in review_df.iterrows():
+        temp_display_qids.append(str(row.get("Query_Object_Identifier", "")))
+
+    # Auto-save changes immediately to prevent data loss (disruption recovery)
+    if "review_editor" in st.session_state and "edited_rows" in st.session_state.review_editor:
+        edits = st.session_state.review_editor["edited_rows"]
+        if edits:
+            from am_ais_assist.pipeline import model as _pipeline_model  # noqa: PLC0415
+            results_by_qid = {
+                str(r.get("Query_Object_Identifier", "")): r for r in results
+            }
+            user_id = st.session_state.get("user_id", st.session_state.get("user_session_id", ""))
+            session_id = st.session_state.get("user_session_id", "")
+            user_name = st.session_state.get("user_name", "unknown")
+            base_hash = st.session_state.get("base_file_hash", "")
+            check_hash = st.session_state.get("check_file_hash", "")
+            prompt_ver = st.session_state.get("active_prompt_version", "v1")
+            
+            for row_idx_str, row_edits in edits.items():
+                row_idx = int(row_idx_str)
+                if row_idx < len(temp_display_qids):
+                    qid = temp_display_qids[row_idx]
+                    updated = False
+                    if "Review" in row_edits:
+                        new_verdict = row_edits["Review"]
+                        if review_statuses.get(qid) != new_verdict:
+                            review_statuses[qid] = new_verdict
+                            updated = True
+                    if "User Remark" in row_edits:
+                        new_remark = row_edits["User Remark"]
+                        if review_remarks.get(qid) != new_remark:
+                            review_remarks[qid] = new_remark
+                            updated = True
+                            
+                    # Auto-persist immediately to ChromaDB FeedbackStore
+                    if updated and qid in results_by_qid:
+                        orig = results_by_qid[qid]
+                        verdict = review_statuses.get(qid, "Pending")
+                        remark = review_remarks.get(qid, "")
+                        
+                        # Only save non-exact matches to FeedbackStore (Bug C fix)
+                        ai_level = str(orig.get("Similarity_Level", ""))
+                        if verdict != "Pending" and ai_level not in ("Exact Match", "Below Threshold") and _pipeline_model is not None:
+                            try:
+                                feedback_store.save_feedback(
+                                    user_id=user_id,
+                                    user_name=user_name,
+                                    session_id=session_id,
+                                    query_id=qid,
+                                    matched_id=str(orig.get("Matched_Object_Identifier", "")),
+                                    query_text=str(orig.get("Query_Sentence", ""))[:500],
+                                    matched_text=str(orig.get("Matched_Sentence", ""))[:500],
+                                    query_cleaned=str(orig.get("Query_Sentence_Cleaned_text", ""))[:300],
+                                    matched_cleaned=str(orig.get("Matched_Sentence_Cleaned_text", ""))[:300],
+                                    ai_score=orig.get("Similarity_Score", 0),
+                                    ai_level=ai_level,
+                                    ai_remark=str(orig.get("Remark", ""))[:300],
+                                    verdict=verdict,
+                                    base_file_hash=base_hash,
+                                    check_file_hash=check_hash,
+                                    prompt_version=prompt_ver,
+                                    model=_pipeline_model,
+                                    user_remark=remark,
+                                )
+                                logging.debug(f"Auto-saved verdict/remark for qid={qid}")
+                            except Exception as _save_exc:
+                                logging.warning("Could not auto-save feedback: %s", _save_exc)
+
     if review_df.empty:
         st.info("No rows to review with the current filter.")
         return
@@ -313,6 +385,7 @@ def render_review_panel(
                 f"({row.get('Similarity_Score', '')})"
             ),
             "Review": review_statuses.get(qid, "Pending"),
+            "User Remark": review_remarks.get(qid, ""),
         })
     display_df = pd.DataFrame(display_rows)
 
@@ -323,6 +396,10 @@ def render_review_panel(
                 "Your Review",
                 options=["Pending", "OK", "Not OK"],
                 required=True,
+            ),
+            "User Remark": st.column_config.TextColumn(
+                "User Remark",
+                max_chars=200,
             )
         },
         disabled=["Query ID", "Query Sentence", "AI Decision"],
@@ -331,64 +408,107 @@ def render_review_panel(
         key="review_editor",
     )
 
+    # Approve all exact matches button
+    if st.button("✅ Mark All Exact Matches as OK", key="btn_approve_exact"):
+        approved_count = 0
+        for r in results:
+            if r.get("Similarity_Level") == "Exact Match":
+                qid = str(r.get("Query_Object_Identifier", ""))
+                if review_statuses.get(qid) != "OK":
+                    review_statuses[qid] = "OK"
+                    approved_count += 1
+        if approved_count > 0:
+            st.success(f"Marked {approved_count} Exact Match rows as OK.")
+            st.rerun()
+
     col_save, col_download = st.columns(2)
+
+    results_by_qid = {
+        str(r.get("Query_Object_Identifier", "")): r for r in results
+    }
+    user_id = st.session_state.get("user_id", st.session_state.get("user_session_id", ""))
+    session_id = st.session_state.get("user_session_id", "")
+    user_name = st.session_state.get("user_name", "unknown")
+    base_hash = st.session_state.get("base_file_hash", "")
+    check_hash = st.session_state.get("check_file_hash", "")
+    prompt_ver = st.session_state.get("active_prompt_version", "v1")
 
     with col_save:
         if st.button("💾 Save Reviews", key="btn_save_reviews"):
-            # Build a quick lookup of result rows by query_id
-            results_by_qid = {
-                str(r.get("Query_Object_Identifier", "")): r for r in results
-            }
-
             saved_count = 0
-            user_id = st.session_state.get("user_id", st.session_state.get("user_session_id", ""))
-            session_id = st.session_state.get("user_session_id", "")
-            user_name = st.session_state.get("user_name", "unknown")
-            base_hash = st.session_state.get("base_file_hash", "")
-            check_hash = st.session_state.get("check_file_hash", "")
-            prompt_ver = st.session_state.get("active_prompt_version", "v1")
-
             from am_ais_assist.pipeline import model as _pipeline_model  # noqa: PLC0415
 
             for _, edited_row in edited.iterrows():
                 qid = str(edited_row["Query ID"])
                 verdict = str(edited_row["Review"])
+                remark = str(edited_row.get("User Remark", ""))
                 if verdict == "Pending":
                     continue
 
                 # Update session state immediately
-                st.session_state.review_statuses[qid] = verdict
+                review_statuses[qid] = verdict
+                review_remarks[qid] = remark
 
                 # Persist to FeedbackStore
                 orig = results_by_qid.get(qid)
                 if orig and _pipeline_model is not None:
-                    try:
-                        feedback_store.save_feedback(
-                            user_id=user_id,
-                            user_name=user_name,
-                            session_id=session_id,
-                            query_id=qid,
-                            matched_id=str(orig.get("Matched_Object_Identifier", "")),
-                            query_text=str(orig.get("Query_Sentence", ""))[:500],
-                            matched_text=str(orig.get("Matched_Sentence", ""))[:500],
-                            query_cleaned=str(orig.get("Query_Sentence_Cleaned_text", ""))[:300],
-                            matched_cleaned=str(orig.get("Matched_Sentence_Cleaned_text", ""))[:300],
-                            ai_score=orig.get("Similarity_Score", 0),
-                            ai_level=str(orig.get("Similarity_Level", "")),
-                            ai_remark=str(orig.get("Remark", ""))[:300],
-                            verdict=verdict,
-                            base_file_hash=base_hash,
-                            check_file_hash=check_hash,
-                            prompt_version=prompt_ver,
-                            model=_pipeline_model,
-                        )
-                        saved_count += 1
-                    except Exception as _save_exc:  # noqa: BLE001
-                        logging.warning("Could not save feedback for %s: %s", qid, _save_exc)
+                    # Skip storing feedback for trivial matches (Bug C fix)
+                    ai_level = str(orig.get("Similarity_Level", ""))
+                    if ai_level not in ("Exact Match", "Below Threshold"):
+                        try:
+                            feedback_store.save_feedback(
+                                user_id=user_id,
+                                user_name=user_name,
+                                session_id=session_id,
+                                query_id=qid,
+                                matched_id=str(orig.get("Matched_Object_Identifier", "")),
+                                query_text=str(orig.get("Query_Sentence", ""))[:500],
+                                matched_text=str(orig.get("Matched_Sentence", ""))[:500],
+                                query_cleaned=str(orig.get("Query_Sentence_Cleaned_text", ""))[:300],
+                                matched_cleaned=str(orig.get("Matched_Sentence_Cleaned_text", ""))[:300],
+                                ai_score=orig.get("Similarity_Score", 0),
+                                ai_level=ai_level,
+                                ai_remark=str(orig.get("Remark", ""))[:300],
+                                verdict=verdict,
+                                base_file_hash=base_hash,
+                                check_file_hash=check_hash,
+                                prompt_version=prompt_ver,
+                                model=_pipeline_model,
+                                user_remark=remark,
+                            )
+                            saved_count += 1
+                        except Exception as _save_exc:  # noqa: BLE001
+                            logging.warning("Could not save feedback for %s: %s", qid, _save_exc)
+
+            # Trigger Continuous Learning loop skill extraction (Q3/concurrency-safe file lock inside)
+            corrections_list = []
+            for qid, verdict in review_statuses.items():
+                if verdict != "Pending":
+                    orig = results_by_qid.get(qid)
+                    if orig:
+                        ai_level = str(orig.get("Similarity_Level", ""))
+                        if ai_level not in ("Exact Match", "Below Threshold"):
+                            corrections_list.append({
+                                "base_text": str(orig.get("Query_Sentence", "")),
+                                "new_text": str(orig.get("Matched_Sentence", "")),
+                                "ai_level": ai_level,
+                                "ai_score": orig.get("Similarity_Score", 0),
+                                "verdict": verdict,
+                                "user_remark": review_remarks.get(qid, "")
+                            })
+            if corrections_list:
+                import threading
+                from am_ais_assist.skill_generator import extract_and_update_skills
+                threading.Thread(
+                    target=extract_and_update_skills,
+                    args=(user_id, corrections_list),
+                    daemon=True
+                ).start()
+                st.info("🔄 Continuous Learning: Analyzing review patterns in the background...")
 
             # Canary monitoring: record agreement rate for this session
             if prompt_ver != "v1" and saved_count > 0:
-                all_verdicts = list(st.session_state.review_statuses.values())
+                all_verdicts = list(review_statuses.values())
                 reviewed = [v for v in all_verdicts if v != "Pending"]
                 if reviewed:
                     agreement_rate = sum(1 for v in reviewed if v == "OK") / len(reviewed)
@@ -410,9 +530,37 @@ def render_review_panel(
 
     with col_download:
         if st.session_state.get("results_df") is not None:
+            # Trigger skill extraction on download as well
+            corrections_list = []
+            for qid, verdict in review_statuses.items():
+                if verdict != "Pending":
+                    orig = results_by_qid.get(qid)
+                    if orig:
+                        ai_level = str(orig.get("Similarity_Level", ""))
+                        if ai_level not in ("Exact Match", "Below Threshold"):
+                            corrections_list.append({
+                                "base_text": str(orig.get("Query_Sentence", "")),
+                                "new_text": str(orig.get("Matched_Sentence", "")),
+                                "ai_level": ai_level,
+                                "ai_score": orig.get("Similarity_Score", 0),
+                                "verdict": verdict,
+                                "user_remark": review_remarks.get(qid, "")
+                            })
+            if corrections_list:
+                import threading
+                from am_ais_assist.skill_generator import extract_and_update_skills
+                threading.Thread(
+                    target=extract_and_update_skills,
+                    args=(user_id, corrections_list),
+                    daemon=True
+                ).start()
+
             df_with_review = st.session_state.results_df.copy()
             df_with_review["Review_Status"] = df_with_review["Query_Object_Identifier"].map(
-                lambda qid: st.session_state.review_statuses.get(str(qid), "Pending")
+                lambda qid: review_statuses.get(str(qid), "Pending")
+            )
+            df_with_review["User_Remark"] = df_with_review["Query_Object_Identifier"].map(
+                lambda qid: review_remarks.get(str(qid), "")
             )
             excel_bytes = create_highlighted_excel(
                 df_with_review,
@@ -872,6 +1020,7 @@ def main() -> None:  # noqa: PLR0915
                     cache_manager,
                     feedback_store=feedback_store,
                     prompt_registry=prompt_registry,
+                    user_id=st.session_state.get("user_id", "local_user_pseudonym"),
                 )
 
                 st.session_state.results_df = pd.DataFrame(results)
@@ -895,10 +1044,14 @@ def main() -> None:  # noqa: PLR0915
                 )
                 # Initialise review statuses: prior reviews override "Pending" default
                 review_statuses: dict[str, str] = {}
+                review_remarks: dict[str, str] = {}
                 for r in results:
                     qid = str(r.get("Query_Object_Identifier", ""))
-                    review_statuses[qid] = prior_reviews.get(qid, "Pending")
+                    prior = prior_reviews.get(qid, {})
+                    review_statuses[qid] = prior.get("verdict", "Pending")
+                    review_remarks[qid] = prior.get("user_remark", "")
                 st.session_state.review_statuses = review_statuses
+                st.session_state.review_remarks = review_remarks
                 st.session_state.reviews_saved = False
 
                 unified_progress.progress(1.0, text="🎉 All phases complete!")

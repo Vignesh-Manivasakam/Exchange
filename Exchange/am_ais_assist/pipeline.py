@@ -162,6 +162,21 @@ def run_llm_analysis_phase(  # noqa: PLR0912
         return search_results, _empty_tokens
 
     try:
+        effective_prompt = active_prompt_text
+        if effective_prompt is None:
+            from am_ais_assist.llm_service import SYSTEM_PROMPT as _default_prompt
+            effective_prompt = _default_prompt
+            
+        if user_id:
+            try:
+                from am_ais_assist.skill_generator import get_user_skills_prompt_context
+                user_rules = get_user_skills_prompt_context(user_id)
+                if user_rules:
+                    effective_prompt = effective_prompt + "\n\n" + user_rules
+                    logging.info("Injected user-specific skills for user_id=%s into prompt", user_id)
+            except Exception as _skills_exc:
+                logging.warning("Failed to load user skills context: %s", _skills_exc)
+
         logging.info("Starting LLM analysis for %d results.", len(search_results))
 
         initial_df = pd.DataFrame(search_results)
@@ -257,7 +272,7 @@ def run_llm_analysis_phase(  # noqa: PLR0912
                         llm_pairs,
                         user_session_id,
                         cache_manager,
-                        system_prompt=active_prompt_text,  # Phase 5: canary routing
+                        system_prompt=effective_prompt,  # Injected prompt override (Q2)
                     )
                     for idx, result in zip(llm_indices, batch_response["results"], strict=False):
                         batch_results[idx] = result
@@ -334,6 +349,7 @@ def run_similarity_pipeline(  # noqa: PLR0913 PLR0915
     cache_manager: Any | None = None,
     feedback_store: Any | None = None,
     prompt_registry: Any | None = None,
+    user_id: str | None = None,
 ) -> tuple:
     """
     End-to-end similarity search pipeline.
@@ -559,9 +575,8 @@ def run_similarity_pipeline(  # noqa: PLR0913 PLR0915
 
         # Phase 5: extract user_id for feedback recall
         # user_session_id is a UUID; user_id from app.py auth headers is the
-        # stable Bosch user identifier. We pass user_session_id as fallback
-        # since we don't have the auth header user_id at this level.
-        _user_id_for_recall = user_session_id
+        # stable user identifier. We pass user_id if provided, otherwise fallback.
+        _user_id_for_recall = user_id if user_id else user_session_id
 
         try:
             enriched_results, llm_tokens = run_llm_analysis_phase(

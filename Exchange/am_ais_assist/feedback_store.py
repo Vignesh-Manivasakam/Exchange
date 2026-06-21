@@ -165,6 +165,7 @@ class FeedbackStore:
         check_file_hash: str,
         prompt_version: str,
         model: Any,
+        user_remark: str = "",
     ) -> str:
         """Persist one reviewed result row to both user and global collections.
 
@@ -186,10 +187,15 @@ class FeedbackStore:
             check_file_hash: SHA-256 of the check Excel file (for run identity).
             prompt_version:  Active prompt version string (e.g. "v1").
             model:           EmbeddingModel instance for pair encoding.
+            user_remark:     Optional remark/comment from the user.
 
         Returns:
             feedback_id (str) — the deterministic SHA-256 record identifier.
         """
+        # Normalize verdict to "Not Ok" for global self_improve consistency
+        if verdict in ("Not OK", "Not Ok", "not ok"):
+            verdict = "Not Ok"
+
         feedback_id = _make_feedback_id(user_id, query_id, matched_id)
 
         # Encode the pair — used for Level 1 semantic recall
@@ -215,6 +221,7 @@ class FeedbackStore:
             "ai_level": ai_level,
             "ai_remark": ai_remark[:300],
             "verdict": verdict,
+            "user_remark": str(user_remark)[:200],
             "base_file_hash": base_file_hash[:32],
             "check_file_hash": check_file_hash[:32],
             "prompt_version": prompt_version,
@@ -263,7 +270,7 @@ class FeedbackStore:
         user_id: str,
         base_file_hash: str,
         check_file_hash: str,
-    ) -> dict[str, str]:
+    ) -> dict[str, dict[str, str]]:
         """Load prior reviews for a specific (user, base_file, check_file) combination.
 
         Called after the pipeline runs to pre-populate the review panel with
@@ -275,7 +282,7 @@ class FeedbackStore:
             check_file_hash: First 32 chars of the check file SHA-256 hash.
 
         Returns:
-            dict mapping query_id → verdict ("OK" | "Not OK") for all
+            dict mapping query_id → {"verdict": verdict, "user_remark": remark} for all
             previously reviewed rows.  Returns ``{}`` when no prior reviews
             exist or the collection has not been created yet.
         """
@@ -294,12 +301,13 @@ class FeedbackStore:
                 },
                 include=["metadatas"],
             )
-            reviews: dict[str, str] = {}
+            reviews: dict[str, dict[str, str]] = {}
             for meta in results.get("metadatas", []):
                 qid = meta.get("query_id", "")
                 verdict = meta.get("verdict", "Pending")
+                user_remark = meta.get("user_remark", "")
                 if qid:
-                    reviews[qid] = verdict
+                    reviews[qid] = {"verdict": verdict, "user_remark": user_remark}
             logger.info(
                 "FeedbackStore: loaded %d prior reviews for user %s on this file pair.",
                 len(reviews),
@@ -422,7 +430,7 @@ class FeedbackStore:
             all_meta = all_results.get("metadatas", [])
 
             total = len(all_meta)
-            not_ok = [m for m in all_meta if m.get("verdict") == "Not Ok"]
+            not_ok = [m for m in all_meta if str(m.get("verdict")).lower() in ("not ok", "not_ok")]
 
             # Group Not Ok verdicts by AI level
             by_level: dict[str, int] = {}
@@ -537,5 +545,5 @@ class FeedbackStore:
         """
         if not metadata_list:
             return 0.0
-        ok_count = sum(1 for m in metadata_list if m.get("verdict") == "OK")
+        ok_count = sum(1 for m in metadata_list if str(m.get("verdict")).upper() == "OK")
         return ok_count / len(metadata_list)

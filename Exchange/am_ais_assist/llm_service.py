@@ -284,7 +284,7 @@ def _call_llm_api(
             n=1,
         )
 
-        content = response.choices[0].message.content
+        content = response.choices[0].message.content or ""
         completion_tokens = estimate_tokens(content)
 
         # Safely extract JSON, handling markdown code fences
@@ -397,7 +397,8 @@ def _process_batch(
 
     # 3. Cache only clean results (not error results)
     all_clean = all(
-        res.get("Similarity_Level") not in ("Error", "Parse Error", "LLM API Call Failed")
+        not str(res.get("Similarity_Level", "")).endswith("Error")
+        and res.get("Similarity_Level") not in ("LLM API Call Failed",)
         for res in response["results"]
     )
     if all_clean:
@@ -698,4 +699,5 @@ def call_section_detector(column_names: list, sample_rows: list) -> dict:
 
     except Exception as exc:  # noqa: BLE001
         logger.warning("call_section_detector failed: %s", exc)
-        return dict(_SECTION_STRATEGY_FALLBACK)
+        import copy
+        return copy.deepcopy(_SECTION_STRATEGY_FALLBACK)

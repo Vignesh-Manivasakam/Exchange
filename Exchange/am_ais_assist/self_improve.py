@@ -376,7 +376,7 @@ def run_gate3_validation(
     holdout_ids = gate1_result.get("holdout_ids", [])
     holdout_meta = feedback_store.get_by_ids(holdout_ids)  # type: ignore[attr-defined]
     # Filter to "Not Ok" cases only for the shadow test
-    holdout_not_ok = [m for m in holdout_meta if m.get("verdict") == "Not Ok"]
+    holdout_not_ok = [m for m in holdout_meta if str(m.get("verdict")).lower() in ("not ok", "not_ok")]
 
     if not holdout_not_ok:
         # No holdout data available — skip shadow test, pass by default
