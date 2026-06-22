@@ -99,6 +99,27 @@ _component_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "am_a
 _report_viewer = components.declare_component("report_viewer", path=_component_path)
 
 
+def start_periodic_cleanup():
+    """Start a background thread that periodically cleans up expired cache files (Risk 4 fix)."""
+    import threading
+    import time
+    def _cleanup_loop():
+        # Wait 10 minutes on startup, then clean up every 2 hours
+        time.sleep(600)
+        while True:
+            try:
+                from am_ais_assist.config import cleanup_expired_sessions
+                cleanup_expired_sessions()
+                logging.info("Background cleanup: expired sessions purged.")
+            except Exception as e:
+                logging.warning("Background cleanup failed: %s", e)
+            # Sleep for 2 hours
+            time.sleep(7200)
+
+    t = threading.Thread(target=_cleanup_loop, daemon=True)
+    t.start()
+
+
 # ---------------------------------------------------------------------------
 # M-3: Startup cleanup — run once per process to purge expired session dirs
 # ---------------------------------------------------------------------------
@@ -108,6 +129,9 @@ def _run_startup_cleanup():
         from am_ais_assist.config import cleanup_expired_sessions
         cleanup_expired_sessions()
         logging.info("Startup: expired session cleanup complete.")
+        # Start background periodic cache cleanup thread
+        start_periodic_cleanup()
+        logging.info("Startup: background periodic cache cleanup thread started.")
     except Exception as exc:  # noqa: BLE001
         logging.warning("Startup cleanup failed (non-fatal): %s", exc)
 
@@ -128,6 +152,17 @@ def initialize_user_session() -> str:
         logging.info("New user session created: %s", st.session_state.user_session_id)
 
     if "user_name" not in st.session_state:
+        # Check gateway secret if configured in env (Risk 1 fix — header spoofing protection)
+        gateway_secret = os.getenv("GATEWAY_SECRET", "")
+        if gateway_secret:
+            req_secret = st.context.headers.get("X-Gateway-Secret", "")
+            if req_secret != gateway_secret:
+                logging.warning("Security Warning: request headers missing or invalid X-Gateway-Secret. Reverting to guest.")
+                st.session_state.user_name = "guest_user"
+                st.session_state.user_email = "guest_user@bosch.com"
+                st.session_state.user_id = "guest_user_pseudonym"
+                return st.session_state.user_session_id
+
         st.session_state.user_name = st.context.headers.get(
             "X-Auth-Request-Preferred-Username", "local_user"
         )

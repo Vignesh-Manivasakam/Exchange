@@ -29,6 +29,8 @@ from sklearn.preprocessing import normalize
 
 from am_ais_assist.config import (
     CHROMA_PERSIST_DIR,
+    CHROMA_SERVER_HOST,
+    CHROMA_SERVER_PORT,
     EMBEDDING_API_KEY,
     EMBEDDING_API_VERSION,
     EMBEDDING_BASE_URL,
@@ -101,7 +103,7 @@ _chroma_client_lock = threading.Lock()  # C-3 + H-2: thread-safe singleton and r
 
 
 def _get_chroma_client() -> chromadb.ClientAPI:
-    """Return the singleton ChromaDB persistent client.
+    """Return the singleton ChromaDB persistent or HTTP client.
 
     Self-heals when the on-disk database was created by an older ChromaDB
     version (e.g. pre-1.0) whose tenant schema is incompatible with the
@@ -113,39 +115,55 @@ def _get_chroma_client() -> chromadb.ClientAPI:
     if _chroma_client is None:
         with _chroma_client_lock:  # C-3: double-checked locking; H-2: protects shutil.rmtree
             if _chroma_client is None:
-                os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
-                try:
-                    _chroma_client = chromadb.PersistentClient(
-                        path=CHROMA_PERSIST_DIR,
-                        settings=Settings(anonymized_telemetry=False),
-                    )
-                    logger.info("ChromaDB persistent client initialised at %s", CHROMA_PERSIST_DIR)
-                except Exception as exc:  # noqa: BLE001
-                    # ChromaDB ≥1.0 changed the tenant schema; the error message
-                    # contains "tenant" when the existing SQLite database is stale.
-                    if "tenant" in str(exc).lower():
-                        logger.warning(
-                            "ChromaDB tenant schema mismatch — wiping stale directory at %s and "
-                            "reinitialising.  Embeddings will be recomputed on the next run. "
-                            "Original error: %s",
-                            CHROMA_PERSIST_DIR,
-                            exc,
+                if CHROMA_SERVER_HOST:
+                    try:
+                        _chroma_client = chromadb.HttpClient(
+                            host=CHROMA_SERVER_HOST,
+                            port=CHROMA_SERVER_PORT,
+                            settings=Settings(anonymized_telemetry=False),
                         )
-                        import shutil
-
-                        shutil.rmtree(
-                            CHROMA_PERSIST_DIR, ignore_errors=True
-                        )  # H-2: protected by lock
-                        os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+                        logger.info(
+                            "ChromaDB HTTP client initialised connecting to %s:%s",
+                            CHROMA_SERVER_HOST,
+                            CHROMA_SERVER_PORT,
+                        )
+                    except Exception as exc:
+                        logger.error("Failed to initialize ChromaDB HTTP client: %s", exc)
+                        raise
+                else:
+                    os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+                    try:
                         _chroma_client = chromadb.PersistentClient(
                             path=CHROMA_PERSIST_DIR,
                             settings=Settings(anonymized_telemetry=False),
                         )
-                        logger.info(
-                            "ChromaDB client reinitialised (clean) at %s", CHROMA_PERSIST_DIR
-                        )
-                    else:
-                        raise
+                        logger.info("ChromaDB persistent client initialised at %s", CHROMA_PERSIST_DIR)
+                    except Exception as exc:  # noqa: BLE001
+                        # ChromaDB ≥1.0 changed the tenant schema; the error message
+                        # contains "tenant" when the existing SQLite database is stale.
+                        if "tenant" in str(exc).lower():
+                            logger.warning(
+                                "ChromaDB tenant schema mismatch — wiping stale directory at %s and "
+                                "reinitialising.  Embeddings will be recomputed on the next run. "
+                                "Original error: %s",
+                                CHROMA_PERSIST_DIR,
+                                exc,
+                            )
+                            import shutil
+
+                            shutil.rmtree(
+                                CHROMA_PERSIST_DIR, ignore_errors=True
+                            )  # H-2: protected by lock
+                            os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+                            _chroma_client = chromadb.PersistentClient(
+                                path=CHROMA_PERSIST_DIR,
+                                settings=Settings(anonymized_telemetry=False),
+                            )
+                            logger.info(
+                                "ChromaDB client reinitialised (clean) at %s", CHROMA_PERSIST_DIR
+                            )
+                        else:
+                            raise
     return _chroma_client
 
 

@@ -97,6 +97,8 @@ HIGH_CONFIDENCE_THRESHOLD = 0.95
 # ChromaDB collection for per-user feedback (prefix only — user_id appended at runtime)
 # Full collection name pattern: "fb_{sanitized_user_id}"
 FEEDBACK_CHROMA_DIR = os.path.join(CACHE_DIR, "feedback_index")
+CHROMA_SERVER_HOST = os.getenv("CHROMA_SERVER_HOST", "")
+CHROMA_SERVER_PORT = os.getenv("CHROMA_SERVER_PORT", "8000")
 
 # Global ChromaDB collection name — aggregates all user feedback for pattern analysis
 FEEDBACK_GLOBAL_COLLECTION = "feedback_global"

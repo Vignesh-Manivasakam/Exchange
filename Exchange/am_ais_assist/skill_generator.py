@@ -4,6 +4,7 @@ import logging
 import datetime
 import uuid
 import filelock
+import sqlite3
 from typing import Any
 
 from am_ais_assist.config import CACHE_DIR
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 _PAIR_SEPARATOR = " ||| "
 
 def get_user_skills_file_path(user_id: str) -> str:
-    """Get the persistent file path for a user's skills JSON profile."""
+    """Get the persistent file path for a user's skills JSON profile (used for legacy lookup/fallbacks)."""
     # Ensure cache directory exists
     skills_dir = os.path.join(CACHE_DIR, "user_skills")
     os.makedirs(skills_dir, exist_ok=True)
@@ -24,47 +25,95 @@ def get_user_skills_file_path(user_id: str) -> str:
         safe_user_id = "default_user"
     return os.path.join(skills_dir, f"user_{safe_user_id}_skills.json")
 
+def get_db_connection():
+    """Return a connection to the central SQLite database for user skills, creating tables if needed."""
+    db_path = os.path.join(CACHE_DIR, "user_skills.db")
+    conn = sqlite3.connect(db_path, timeout=10)
+    # Enable WAL mode for high-concurrency read/write operations
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error:
+        pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_skills (
+            user_id TEXT PRIMARY KEY,
+            profile_json TEXT,
+            last_updated TEXT,
+            version INTEGER
+        )
+    """)
+    conn.commit()
+    return conn
+
 def load_user_skills(user_id: str) -> dict:
-    """Load the user's skill profile, using a file lock for concurrency safety."""
+    """Load the user's skill profile from the SQLite database, migrating legacy JSON if needed."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT profile_json FROM user_skills WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row:
+            conn.close()
+            return json.loads(row[0])
+    except Exception as e:
+        logger.error("Failed to load skills from DB for user %s: %s", user_id, e)
+
+    # Fallback to legacy JSON file
     file_path = get_user_skills_file_path(user_id)
     lock_path = file_path + ".lock"
     
-    if not os.path.exists(file_path):
-        return {
-            "user_id": user_id,
-            "version": 0,
-            "last_updated": "",
-            "skills": [],
-            "history": []
-        }
-        
-    try:
-        # Use filelock to prevent race conditions on concurrent reads/writes
-        with filelock.FileLock(lock_path, timeout=5):
-            with open(file_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        logger.error("Failed to load skills for user %s: %s", user_id, e)
-        return {
-            "user_id": user_id,
-            "version": 0,
-            "last_updated": "",
-            "skills": [],
-            "history": []
-        }
+    profile = {
+        "user_id": user_id,
+        "version": 0,
+        "last_updated": "",
+        "skills": [],
+        "history": []
+    }
+    
+    if os.path.exists(file_path):
+        try:
+            with filelock.FileLock(lock_path, timeout=5):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    profile = json.load(f)
+            # Auto-migrate to SQLite database
+            save_user_skills(user_id, profile)
+            logger.info("Migrated user %s skills from JSON file to central SQLite database.", user_id)
+        except Exception as e:
+            logger.error("Failed to read/migrate legacy skills file for user %s: %s", user_id, e)
+            
+    return profile
 
 def save_user_skills(user_id: str, profile: dict) -> None:
-    """Save the user's skill profile, using a file lock for concurrency safety."""
-    file_path = get_user_skills_file_path(user_id)
-    lock_path = file_path + ".lock"
-    
+    """Save the user's skill profile to the central SQLite database with a fallback to legacy JSON file."""
     try:
-        # Use filelock to serialize write operations
-        with filelock.FileLock(lock_path, timeout=5):
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(profile, f, indent=2)
+        conn = get_db_connection()
+        version = profile.get("version", 0)
+        last_updated = profile.get("last_updated", "")
+        profile_json = json.dumps(profile, indent=2)
+        
+        with conn:
+            conn.execute("""
+                INSERT INTO user_skills (user_id, profile_json, last_updated, version)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    profile_json=excluded.profile_json,
+                    last_updated=excluded.last_updated,
+                    version=excluded.version
+            """, (user_id, profile_json, last_updated, version))
+        conn.close()
     except Exception as e:
-        logger.error("Failed to save skills for user %s: %s", user_id, e)
+        logger.error("Failed to save skills for user %s to database: %s", user_id, e)
+        
+        # Fallback to local JSON file
+        file_path = get_user_skills_file_path(user_id)
+        lock_path = file_path + ".lock"
+        try:
+            with filelock.FileLock(lock_path, timeout=5):
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(profile, f, indent=2)
+            logger.warning("Fell back to saving JSON file for user %s due to DB failure.", user_id)
+        except Exception as fe:
+            logger.error("Critical: Fallback save failed for user %s: %s", user_id, fe)
 
 def get_user_skills_prompt_context(user_id: str) -> str:
     """Load user skills and format active ones into instructions for system prompt injection.
