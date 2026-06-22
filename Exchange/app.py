@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
 # Logging — configured before any other app imports so all modules
@@ -92,6 +93,10 @@ def get_prompt_registry():
 cache_manager = get_global_cache_manager()
 feedback_store = get_feedback_store()
 prompt_registry = get_prompt_registry()
+
+# Declare the custom interactive Excel-like HTML/JS report viewer component
+_component_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "am_ais_assist", "report_viewer")
+_report_viewer = components.declare_component("report_viewer", path=_component_path)
 
 
 # ---------------------------------------------------------------------------
@@ -244,337 +249,7 @@ def render_filter_panel(df: pd.DataFrame) -> pd.DataFrame:
         filtered = filtered[
             filtered["Query_Object_Identifier"].map(_section) == selected_section
         ]
-
     return filtered
-
-
-# ---------------------------------------------------------------------------
-# Phase 6 — Review Panel
-# ---------------------------------------------------------------------------
-
-
-def render_review_panel(
-    results_df: pd.DataFrame,
-    results: list,
-) -> None:
-    """Render the manual review panel and handle save/download actions."""
-    st.subheader("✏️ Manual Review")
-
-    review_statuses = st.session_state.review_statuses
-    review_remarks = st.session_state.review_remarks
-    total = len(results_df)
-    pending = sum(1 for v in review_statuses.values() if v == "Pending")
-    ok_count = sum(1 for v in review_statuses.values() if v == "OK")
-    not_ok_count = sum(1 for v in review_statuses.values() if v == "Not OK")
-
-    st.caption(
-        f"Total: {total} | ✅ OK: {ok_count} | ❌ Not OK: {not_ok_count} | ⏳ Pending: {pending}"
-    )
-
-    # Decide which rows to show in the review editor
-    show_all = st.checkbox("Show all rows in review panel", value=False, key="review_show_all")
-
-    if show_all:
-        review_df = results_df
-        st.caption(f"Showing all {len(review_df)} rows.")
-    else:
-        # Default: only show uncertain rows (score in the ambiguous 0.40–0.90 band)
-        if "Similarity_Score" in results_df.columns:
-            scores = pd.to_numeric(results_df["Similarity_Score"], errors="coerce")
-            uncertain_mask = (scores >= 0.40) & (scores <= 0.90)
-            # Also include New Requirement and Deleted rows
-            if "Similarity_Level" in results_df.columns:
-                special_mask = results_df["Similarity_Level"].isin(["New Requirement", "Deleted"])
-                review_df = results_df[uncertain_mask | special_mask]
-            else:
-                review_df = results_df[uncertain_mask]
-        else:
-            review_df = results_df
-        st.caption(
-            f"Showing {len(review_df)} rows that need attention "
-            f"(score 0.40–0.90 + New/Deleted). Toggle above to show all."
-        )
-
-    # Build reference of display QIDs to map from row indexes during auto-save
-    temp_display_qids = []
-    for _, row in review_df.iterrows():
-        temp_display_qids.append(str(row.get("Query_Object_Identifier", "")))
-
-    # Auto-save changes immediately to prevent data loss (disruption recovery)
-    if "review_editor" in st.session_state and "edited_rows" in st.session_state.review_editor:
-        edits = st.session_state.review_editor["edited_rows"]
-        if edits:
-            from am_ais_assist.pipeline import model as _pipeline_model  # noqa: PLC0415
-            results_by_qid = {
-                str(r.get("Query_Object_Identifier", "")): r for r in results
-            }
-            user_id = st.session_state.get("user_id", st.session_state.get("user_session_id", ""))
-            session_id = st.session_state.get("user_session_id", "")
-            user_name = st.session_state.get("user_name", "unknown")
-            base_hash = st.session_state.get("base_file_hash", "")
-            check_hash = st.session_state.get("check_file_hash", "")
-            prompt_ver = st.session_state.get("active_prompt_version", "v1")
-            
-            for row_idx_str, row_edits in edits.items():
-                row_idx = int(row_idx_str)
-                if row_idx < len(temp_display_qids):
-                    qid = temp_display_qids[row_idx]
-                    updated = False
-                    if "Review" in row_edits:
-                        new_verdict = row_edits["Review"]
-                        if review_statuses.get(qid) != new_verdict:
-                            review_statuses[qid] = new_verdict
-                            updated = True
-                    if "User Remark" in row_edits:
-                        new_remark = row_edits["User Remark"]
-                        if review_remarks.get(qid) != new_remark:
-                            review_remarks[qid] = new_remark
-                            updated = True
-                            
-                    # Auto-persist immediately to ChromaDB FeedbackStore
-                    if updated and qid in results_by_qid:
-                        orig = results_by_qid[qid]
-                        verdict = review_statuses.get(qid, "Pending")
-                        remark = review_remarks.get(qid, "")
-                        
-                        # Only save non-exact matches to FeedbackStore (Bug C fix)
-                        ai_level = str(orig.get("Similarity_Level", ""))
-                        if verdict != "Pending" and ai_level not in ("Exact Match", "Below Threshold") and _pipeline_model is not None:
-                            try:
-                                feedback_store.save_feedback(
-                                    user_id=user_id,
-                                    user_name=user_name,
-                                    session_id=session_id,
-                                    query_id=qid,
-                                    matched_id=str(orig.get("Matched_Object_Identifier", "")),
-                                    query_text=str(orig.get("Query_Sentence", ""))[:500],
-                                    matched_text=str(orig.get("Matched_Sentence", ""))[:500],
-                                    query_cleaned=str(orig.get("Query_Sentence_Cleaned_text", ""))[:300],
-                                    matched_cleaned=str(orig.get("Matched_Sentence_Cleaned_text", ""))[:300],
-                                    ai_score=orig.get("Similarity_Score", 0),
-                                    ai_level=ai_level,
-                                    ai_remark=str(orig.get("Remark", ""))[:300],
-                                    verdict=verdict,
-                                    base_file_hash=base_hash,
-                                    check_file_hash=check_hash,
-                                    prompt_version=prompt_ver,
-                                    model=_pipeline_model,
-                                    user_remark=remark,
-                                )
-                                logging.debug(f"Auto-saved verdict/remark for qid={qid}")
-                            except Exception as _save_exc:
-                                logging.warning("Could not auto-save feedback: %s", _save_exc)
-
-    if review_df.empty:
-        st.info("No rows to review with the current filter.")
-        return
-
-    # Build the editable display DataFrame
-    def _truncate(text: str, n: int = 80) -> str:
-        s = str(text)
-        return s[:n] + "..." if len(s) > n else s
-
-    display_rows = []
-    for _, row in review_df.iterrows():
-        qid = str(row.get("Query_Object_Identifier", ""))
-        display_rows.append({
-            "Query ID": qid,
-            "Query Sentence": _truncate(row.get("Query_Sentence", "")),
-            "AI Decision": (
-                f"{row.get('Similarity_Level', '')} "
-                f"({row.get('Similarity_Score', '')})"
-            ),
-            "Review": review_statuses.get(qid, "Pending"),
-            "User Remark": review_remarks.get(qid, ""),
-        })
-    display_df = pd.DataFrame(display_rows)
-
-    edited = st.data_editor(
-        display_df,
-        column_config={
-            "Review": st.column_config.SelectboxColumn(
-                "Your Review",
-                options=["Pending", "OK", "Not OK"],
-                required=True,
-            ),
-            "User Remark": st.column_config.TextColumn(
-                "User Remark",
-                max_chars=200,
-            )
-        },
-        disabled=["Query ID", "Query Sentence", "AI Decision"],
-        hide_index=True,
-        use_container_width=True,
-        key="review_editor",
-    )
-
-    # Approve all exact matches button
-    if st.button("✅ Mark All Exact Matches as OK", key="btn_approve_exact"):
-        approved_count = 0
-        for r in results:
-            if r.get("Similarity_Level") == "Exact Match":
-                qid = str(r.get("Query_Object_Identifier", ""))
-                if review_statuses.get(qid) != "OK":
-                    review_statuses[qid] = "OK"
-                    approved_count += 1
-        if approved_count > 0:
-            st.success(f"Marked {approved_count} Exact Match rows as OK.")
-            st.rerun()
-
-    col_save, col_download = st.columns(2)
-
-    results_by_qid = {
-        str(r.get("Query_Object_Identifier", "")): r for r in results
-    }
-    user_id = st.session_state.get("user_id", st.session_state.get("user_session_id", ""))
-    session_id = st.session_state.get("user_session_id", "")
-    user_name = st.session_state.get("user_name", "unknown")
-    base_hash = st.session_state.get("base_file_hash", "")
-    check_hash = st.session_state.get("check_file_hash", "")
-    prompt_ver = st.session_state.get("active_prompt_version", "v1")
-
-    with col_save:
-        if st.button("💾 Save Reviews", key="btn_save_reviews"):
-            saved_count = 0
-            from am_ais_assist.pipeline import model as _pipeline_model  # noqa: PLC0415
-
-            for _, edited_row in edited.iterrows():
-                qid = str(edited_row["Query ID"])
-                verdict = str(edited_row["Review"])
-                remark = str(edited_row.get("User Remark", ""))
-                if verdict == "Pending":
-                    continue
-
-                # Update session state immediately
-                review_statuses[qid] = verdict
-                review_remarks[qid] = remark
-
-                # Persist to FeedbackStore
-                orig = results_by_qid.get(qid)
-                if orig and _pipeline_model is not None:
-                    # Skip storing feedback for trivial matches (Bug C fix)
-                    ai_level = str(orig.get("Similarity_Level", ""))
-                    if ai_level not in ("Exact Match", "Below Threshold"):
-                        try:
-                            feedback_store.save_feedback(
-                                user_id=user_id,
-                                user_name=user_name,
-                                session_id=session_id,
-                                query_id=qid,
-                                matched_id=str(orig.get("Matched_Object_Identifier", "")),
-                                query_text=str(orig.get("Query_Sentence", ""))[:500],
-                                matched_text=str(orig.get("Matched_Sentence", ""))[:500],
-                                query_cleaned=str(orig.get("Query_Sentence_Cleaned_text", ""))[:300],
-                                matched_cleaned=str(orig.get("Matched_Sentence_Cleaned_text", ""))[:300],
-                                ai_score=orig.get("Similarity_Score", 0),
-                                ai_level=ai_level,
-                                ai_remark=str(orig.get("Remark", ""))[:300],
-                                verdict=verdict,
-                                base_file_hash=base_hash,
-                                check_file_hash=check_hash,
-                                prompt_version=prompt_ver,
-                                model=_pipeline_model,
-                                user_remark=remark,
-                            )
-                            saved_count += 1
-                        except Exception as _save_exc:  # noqa: BLE001
-                            logging.warning("Could not save feedback for %s: %s", qid, _save_exc)
-
-            # Trigger Continuous Learning loop skill extraction (Q3/concurrency-safe file lock inside)
-            corrections_list = []
-            for qid, verdict in review_statuses.items():
-                if verdict != "Pending":
-                    orig = results_by_qid.get(qid)
-                    if orig:
-                        ai_level = str(orig.get("Similarity_Level", ""))
-                        if ai_level not in ("Exact Match", "Below Threshold"):
-                            corrections_list.append({
-                                "base_text": str(orig.get("Query_Sentence", "")),
-                                "new_text": str(orig.get("Matched_Sentence", "")),
-                                "ai_level": ai_level,
-                                "ai_score": orig.get("Similarity_Score", 0),
-                                "verdict": verdict,
-                                "user_remark": review_remarks.get(qid, "")
-                            })
-            if corrections_list:
-                import threading
-                from am_ais_assist.skill_generator import extract_and_update_skills
-                threading.Thread(
-                    target=extract_and_update_skills,
-                    args=(user_id, corrections_list),
-                    daemon=True
-                ).start()
-                st.info("🔄 Continuous Learning: Analyzing review patterns in the background...")
-
-            # Canary monitoring: record agreement rate for this session
-            if prompt_ver != "v1" and saved_count > 0:
-                all_verdicts = list(review_statuses.values())
-                reviewed = [v for v in all_verdicts if v != "Pending"]
-                if reviewed:
-                    agreement_rate = sum(1 for v in reviewed if v == "OK") / len(reviewed)
-                    try:
-                        canary_result = prompt_registry.record_canary_session(
-                            prompt_ver, agreement_rate
-                        )
-                        if canary_result.get("decision") in ("promote", "rollback"):
-                            st.info(
-                                f"Canary decision: **{canary_result['decision'].upper()}** "
-                                f"(agreement={canary_result.get('canary_agreement_rate', 0):.1%}). "
-                                f"Admin action required."
-                            )
-                    except Exception as _canary_exc:  # noqa: BLE001
-                        logging.debug("Canary recording failed (non-fatal): %s", _canary_exc)
-
-            st.session_state.reviews_saved = True
-            st.success(f"✅ Saved {saved_count} reviews.")
-
-    with col_download:
-        if st.session_state.get("results_df") is not None:
-            # Trigger skill extraction on download as well
-            corrections_list = []
-            for qid, verdict in review_statuses.items():
-                if verdict != "Pending":
-                    orig = results_by_qid.get(qid)
-                    if orig:
-                        ai_level = str(orig.get("Similarity_Level", ""))
-                        if ai_level not in ("Exact Match", "Below Threshold"):
-                            corrections_list.append({
-                                "base_text": str(orig.get("Query_Sentence", "")),
-                                "new_text": str(orig.get("Matched_Sentence", "")),
-                                "ai_level": ai_level,
-                                "ai_score": orig.get("Similarity_Score", 0),
-                                "verdict": verdict,
-                                "user_remark": review_remarks.get(qid, "")
-                            })
-            if corrections_list:
-                import threading
-                from am_ais_assist.skill_generator import extract_and_update_skills
-                threading.Thread(
-                    target=extract_and_update_skills,
-                    args=(user_id, corrections_list),
-                    daemon=True
-                ).start()
-
-            df_with_review = st.session_state.results_df.copy()
-            df_with_review["Review_Status"] = df_with_review["Query_Object_Identifier"].map(
-                lambda qid: review_statuses.get(str(qid), "Pending")
-            )
-            df_with_review["User_Remark"] = df_with_review["Query_Object_Identifier"].map(
-                lambda qid: review_remarks.get(str(qid), "")
-            )
-            excel_bytes = create_highlighted_excel(
-                df_with_review,
-                st.session_state.base_data or [],
-                st.session_state.user_data or [],
-                include_review_status=True,
-            )
-            st.download_button(
-                label="📊 Download Excel with Reviews",
-                data=excel_bytes,
-                file_name="Similarity_Results_Reviewed.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="excel_with_review_download",
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -1109,17 +784,110 @@ def main() -> None:  # noqa: PLR0915
         note += f"<br>🔖 **Prompt version**: {st.session_state.get('active_prompt_version', 'v1')}"
         st.markdown(note, unsafe_allow_html=True)
 
-        st.markdown(
-            df_to_html_table(filtered_df, base_data, user_data), unsafe_allow_html=True
+        # Convert filtered_df to JSON for the iframe component
+        df_json = filtered_df.to_json(orient="records")
+        
+        # Render the custom interactive Excel-like HTML/JS report viewer component
+        state = _report_viewer(
+            df_json=df_json,
+            review_statuses=st.session_state.review_statuses,
+            review_remarks=st.session_state.review_remarks,
+            key="interactive_report_viewer",
+            height=600
         )
-
-        # ── Review panel ──────────────────────────────────────────────────
-        render_review_panel(filtered_df, df.to_dict("records"))
+        
+        # Handle state updates and auto-save reviews to ChromaDB (disruption recovery)
+        if state is not None:
+            updated_statuses = state.get("review_statuses", {})
+            updated_remarks = state.get("review_remarks", {})
+            
+            from am_ais_assist.pipeline import model as _pipeline_model
+            results_by_qid = {
+                str(r.get("Query_Object_Identifier", "")): r for r in df.to_dict("records")
+            }
+            user_id = st.session_state.get("user_id", st.session_state.get("user_session_id", ""))
+            session_id = st.session_state.get("user_session_id", "")
+            user_name = st.session_state.get("user_name", "unknown")
+            base_hash = st.session_state.get("base_file_hash", "")
+            check_hash = st.session_state.get("check_file_hash", "")
+            prompt_ver = st.session_state.get("active_prompt_version", "v1")
+            
+            changed_detected = False
+            for qid, status in updated_statuses.items():
+                old_status = st.session_state.review_statuses.get(qid, "Pending")
+                old_remark = st.session_state.review_remarks.get(qid, "")
+                new_remark = updated_remarks.get(qid, "")
+                
+                if old_status != status or old_remark != new_remark:
+                    st.session_state.review_statuses[qid] = status
+                    st.session_state.review_remarks[qid] = new_remark
+                    changed_detected = True
+                    
+                    if qid in results_by_qid:
+                        orig = results_by_qid[qid]
+                        ai_level = str(orig.get("Similarity_Level", ""))
+                        if status != "Pending" and ai_level not in ("Exact Match", "Below Threshold") and _pipeline_model is not None:
+                            try:
+                                feedback_store.save_feedback(
+                                    user_id=user_id,
+                                    user_name=user_name,
+                                    session_id=session_id,
+                                    query_id=qid,
+                                    matched_id=str(orig.get("Matched_Object_Identifier", "")),
+                                    query_text=str(orig.get("Query_Sentence", ""))[:500],
+                                    matched_text=str(orig.get("Matched_Sentence", ""))[:500],
+                                    query_cleaned=str(orig.get("Query_Sentence_Cleaned_text", ""))[:300],
+                                    matched_cleaned=str(orig.get("Matched_Sentence_Cleaned_text", ""))[:300],
+                                    ai_score=orig.get("Similarity_Score", 0),
+                                    ai_level=ai_level,
+                                    ai_remark=str(orig.get("Remark", ""))[:300],
+                                    verdict=status,
+                                    base_file_hash=base_hash,
+                                    check_file_hash=check_hash,
+                                    prompt_version=prompt_ver,
+                                    model=_pipeline_model,
+                                    user_remark=new_remark,
+                                )
+                                logging.debug(f"Auto-saved verdict/remark for qid={qid} via component update")
+                            except Exception as _save_exc:
+                                logging.warning("Could not auto-save feedback: %s", _save_exc)
+            
+            if state.get("action") == "save":
+                corrections_list = []
+                for qid, verdict in st.session_state.review_statuses.items():
+                    if verdict != "Pending":
+                        orig = results_by_qid.get(qid)
+                        if orig:
+                            ai_level = str(orig.get("Similarity_Level", ""))
+                            if ai_level not in ("Exact Match", "Below Threshold"):
+                                corrections_list.append({
+                                    "base_text": str(orig.get("Query_Sentence", "")),
+                                    "new_text": str(orig.get("Matched_Sentence", "")),
+                                    "ai_level": ai_level,
+                                    "ai_score": orig.get("Similarity_Score", 0),
+                                    "verdict": verdict,
+                                    "user_remark": st.session_state.review_remarks.get(qid, "")
+                                })
+                if corrections_list:
+                    import threading
+                    from am_ais_assist.skill_generator import extract_and_update_skills
+                    threading.Thread(
+                        target=extract_and_update_skills,
+                        args=(user_id, corrections_list),
+                        daemon=True
+                    ).start()
+                    st.toast("🔄 Continuous Learning: Analyzing review patterns in the background...")
+                    st.success("💾 Saved successfully! Analyzing review patterns in the background...")
+                else:
+                    st.success("💾 Saved reviews successfully (no non-trivial corrections to analyze).")
+            
+            if changed_detected:
+                st.rerun()
 
         # ── Download section ──────────────────────────────────────────────
         st.subheader("📥 Download Results")
         st.markdown("Download the results with LLM analysis in your preferred format.")
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown('<div class="download-card">', unsafe_allow_html=True)
             st.download_button(
@@ -1132,6 +900,30 @@ def main() -> None:  # noqa: PLR0915
             st.markdown("</div>", unsafe_allow_html=True)
         with col2:
             st.markdown('<div class="download-card">', unsafe_allow_html=True)
+            # Create Excel with reviews mapped
+            df_with_review = df.copy()
+            df_with_review["Review_Status"] = df_with_review["Query_Object_Identifier"].map(
+                lambda qid: st.session_state.review_statuses.get(str(qid), "Pending")
+            )
+            df_with_review["User_Remark"] = df_with_review["Query_Object_Identifier"].map(
+                lambda qid: st.session_state.review_remarks.get(str(qid), "")
+            )
+            excel_bytes = create_highlighted_excel(
+                df_with_review,
+                st.session_state.base_data or [],
+                st.session_state.user_data or [],
+                include_review_status=True,
+            )
+            st.download_button(
+                label="📊 Download Excel with Reviews",
+                data=excel_bytes,
+                file_name="Similarity_Results_Reviewed.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="excel_with_review_download",
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+        with col3:
+            st.markdown('<div class="download-card">', unsafe_allow_html=True)
             st.download_button(
                 label="💾 Download JSON Results",
                 data=df.to_json(orient="records", indent=2),
@@ -1140,6 +932,7 @@ def main() -> None:  # noqa: PLR0915
                 key="json_download",
             )
             st.markdown("</div>", unsafe_allow_html=True)
+
 
         # ── Admin panel (visible only to admins) ──────────────────────────
         render_admin_panel()
