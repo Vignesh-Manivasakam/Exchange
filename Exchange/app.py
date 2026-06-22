@@ -498,7 +498,7 @@ def load_sidebar():  # noqa: PLR0915
                     if file_changed or st.session_state.base_file_data is None:
                         try:
                             with st.spinner("Reading base file columns..."):
-                                st.session_state.base_file_data = pd.read_excel(base_file)
+                                st.session_state.base_file_data = pd.read_excel(base_file, nrows=0)
                                 st.session_state.base_columns = list(
                                     st.session_state.base_file_data.columns
                                 )
@@ -549,7 +549,7 @@ def load_sidebar():  # noqa: PLR0915
                     if file_changed or st.session_state.check_file_data is None:
                         try:
                             with st.spinner("Reading check file columns..."):
-                                st.session_state.check_file_data = pd.read_excel(check_file)
+                                st.session_state.check_file_data = pd.read_excel(check_file, nrows=0)
                                 st.session_state.check_columns = list(
                                     st.session_state.check_file_data.columns
                                 )
@@ -911,10 +911,10 @@ def main() -> None:  # noqa: PLR0915
                         args=(user_id, corrections_list),
                         daemon=True
                     ).start()
-                    st.toast("🔄 Continuous Learning: Analyzing review patterns in the background...")
-                    st.success("💾 Saved successfully! Analyzing review patterns in the background...")
+                    st.success("💾 Saved successfully!")
                 else:
-                    st.success("💾 Saved reviews successfully (no non-trivial corrections to analyze).")
+                    st.success("💾 Saved reviews successfully.")
+
             
             if changed_detected:
                 st.rerun()
