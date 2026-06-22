@@ -265,6 +265,15 @@
             }, "*");
         }
 
+        // Notify Streamlit of iframe height changes
+        function setFrameHeight(height) {
+            window.parent.postMessage({
+                isStreamlitMessage: true,
+                type: "streamlit:setFrameHeight",
+                value: height
+            }, "*");
+        }
+
         // Listen for data from Streamlit
         window.addEventListener("message", function(event) {
             if (event.data.type === "streamlit:render") {
@@ -282,8 +291,21 @@
                 });
 
                 renderTable();
+                
+                // Auto-adjust height to fit the content
+                setTimeout(() => {
+                    const height = document.body.scrollHeight + 30;
+                    setFrameHeight(height);
+                }, 50);
             }
         });
+
+        // Send componentReady event to Streamlit to initialize handshake
+        window.parent.postMessage({
+            isStreamlitMessage: true,
+            type: "streamlit:componentReady",
+            apiVersion: 1
+        }, "*");
 
         // Parse and render the table
         function renderTable() {
